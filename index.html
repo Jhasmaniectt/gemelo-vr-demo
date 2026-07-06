@@ -136,12 +136,16 @@ const BROKERS = [
   'wss://broker.hivemq.com:8884/mqtt',
   'wss://test.mosquitto.org:8081'
 ];
+// ?broker=1 empieza por HiveMQ, ?broker=2 por Mosquitto (prueba cuál responde mejor desde tu red)
+const BROKER_START = Math.abs(parseInt(params.get('broker')) || 0) % BROKERS.length;
+// ?hz=NN fija la tasa de publicación del sensor (por defecto 30, máx 60)
+const PUB_HZ = Math.min(60, Math.max(5, parseInt(params.get('hz')) || 30));
 
 let client = null;
 
 function connectMqtt(onReady, onMessage, attempt = 0){
   if(attempt >= BROKERS.length * 2){ onReady(null); return; }
-  const url = BROKERS[attempt % BROKERS.length];
+  const url = BROKERS[(BROKER_START + attempt) % BROKERS.length];
   let settled = false;
   const c = mqtt.connect(url, {clean:true, connectTimeout:6000, reconnectPeriod:0,
     clientId:'twin_' + Math.random().toString(16).slice(2,10)});
@@ -181,6 +185,22 @@ function initSender(){
     else if(!firing){ statusTxt.textContent = 'Broker listo — activa el giroscopio'; }
   }, null);
 
+  let lastPub = 0, lastRetain = 0, pubCount = 0;
+  const PUB_INTERVAL = 1000 / PUB_HZ;
+
+  function maybePublish(){
+    if(!firing || !client) return;
+    const now = performance.now();
+    if(now - lastPub < PUB_INTERVAL) return;
+    lastPub = now;
+    const retainNow = now - lastRetain > 1000;   // refresca el "retained" solo 1 vez/s
+    if(retainNow) lastRetain = now;
+    try{
+      client.publish(TOPIC, JSON.stringify({...latest, ts: Date.now()}), {qos:0, retain:retainNow});
+      pubCount++;
+    }catch(e){}
+  }
+
   function onOrient(e){
     firing = true;
     const yaw   = ((e.alpha||0) - 180);
@@ -190,7 +210,8 @@ function initSender(){
     document.getElementById('sYawV').textContent   = Math.round(yaw);
     document.getElementById('sPitchV').textContent = Math.round(pitch);
     document.getElementById('sRollV').textContent  = Math.round(roll);
-    if(mqttOk){ dot.className='dot live'; statusTxt.textContent = 'Transmitiendo a la sala'; }
+    if(mqttOk){ dot.className='dot live'; }
+    maybePublish();                              // publica al ritmo del sensor (event-driven)
   }
 
   btn.addEventListener('click', async ()=>{
@@ -210,13 +231,13 @@ function initSender(){
     }
   });
 
-  // publica a ~10 Hz con retain: los que entren tarde reciben el último estado
+  // keepalive: si el sensor deja de disparar eventos al quedar quieto, seguimos publicando
+  setInterval(maybePublish, 100);
+  // medidor de tasa de ENVÍO — para diagnosticar dónde se pierden muestras
   setInterval(()=>{
-    if(!firing || !client) return;
-    try{
-      client.publish(TOPIC, JSON.stringify({...latest, ts: Date.now()}), {qos:0, retain:true});
-    }catch(e){}
-  }, 100);
+    if(firing && mqttOk) statusTxt.textContent = 'Transmitiendo · ' + pubCount + ' Hz';
+    pubCount = 0;
+  }, 1000);
 }
 
 /* ---------------- ESPECTADOR ---------------- */
@@ -309,7 +330,7 @@ function initViewer(){
   }
 
   function applyOrientation(){
-    const k = 0.18;
+    const k = 0.25;   // más reactivo: la entrada ahora llega a ~30 Hz
     view.yaw   += (target.yaw   - view.yaw)   * k;
     view.pitch += (target.pitch - view.pitch) * k;
     view.roll  += (target.roll  - view.roll)  * k;
