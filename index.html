@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gemelo Digital — Transmisión en vivo (MQTT)</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mqtt/4.3.7/mqtt.min.js"></script>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#121a24; --panel2:#0e151d;
+    --line:#1f2c3a; --txt:#e8eef3; --muted:#7f93a6;
+    --live:#34e1c4; --sim:#ffb454; --off:#5a6b7c; --bad:#ff6b6b;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:var(--bg);color:var(--txt);
+    font-family:ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif;overflow:hidden}
+  .mono{font-family:ui-monospace,"SF Mono","JetBrains Mono",Menlo,monospace}
+  button{font:inherit;font-weight:600;color:var(--txt);
+    background:var(--panel2);border:1px solid var(--line);border-radius:12px;
+    padding:14px 18px;cursor:pointer;transition:.15s}
+  button:hover{border-color:var(--live);color:var(--live)}
+  button.primary{background:var(--live);color:#04120f;border-color:var(--live)}
+  button.primary:hover{filter:brightness(1.08);color:#04120f}
+  button.ghost{background:transparent}
+
+  /* ---------- Selector de rol ---------- */
+  #roleSelect{position:fixed;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:22px;padding:24px;text-align:center}
+  #roleSelect h1{font-size:20px;font-weight:700;max-width:440px}
+  #roleSelect p{font-size:14px;color:var(--muted);max-width:400px;line-height:1.6}
+  .roleBtns{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;margin-top:6px}
+  .roleBtns button{font-size:16px;padding:20px 26px;min-width:200px}
+  .roomTag{font-size:12px;color:var(--muted)}
+  .roomTag b{color:var(--txt)}
+
+  /* ---------- Vista: Sensor (celular del presentador) ---------- */
+  #senderView{position:fixed;inset:0;display:none;flex-direction:column;
+    align-items:center;justify-content:center;gap:20px;padding:24px;text-align:center}
+  .back{position:fixed;top:18px;left:18px}
+  .bigStatus{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:600}
+  .dot{width:12px;height:12px;border-radius:50%;background:var(--off)}
+  .dot.live{background:var(--live);animation:pulse 1.4s infinite}
+  .dot.bad{background:var(--bad)}
+  .dot.sim{background:var(--sim)}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,225,196,.5)}70%{box-shadow:0 0 0 14px rgba(52,225,196,0)}}
+  .senderReadouts{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;width:100%;max-width:420px}
+  .senderReadouts .cell{background:var(--panel2);border:1px solid var(--line);
+    border-radius:14px;padding:16px 8px}
+  .senderReadouts .lbl{font-size:12px;color:var(--muted);letter-spacing:.08em}
+  .senderReadouts .val{font-size:34px;font-weight:700;margin-top:4px}
+  #senderHint{font-size:13px;color:var(--muted);max-width:360px;line-height:1.6}
+
+  /* ---------- Vista: Espectador ---------- */
+  #viewerView{position:fixed;inset:0;display:none}
+  #scene{position:fixed;inset:0}
+  #hud{position:fixed;top:24px;left:24px;background:rgba(18,26,36,.82);
+    border:1px solid var(--line);border-radius:14px;padding:18px 20px;
+    backdrop-filter:blur(6px);min-width:300px}
+  .eyebrow{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--muted)}
+  .status{display:flex;align-items:center;gap:10px;margin-top:8px;font-size:15px;font-weight:600}
+  .readouts{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:16px}
+  .cell{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 8px;text-align:center}
+  .cell .lbl{font-size:11px;color:var(--muted);letter-spacing:.08em}
+  .cell .val{font-size:30px;font-weight:700;line-height:1.1;margin-top:2px}
+  .cell .u{font-size:13px;color:var(--muted)}
+  .rate{margin-top:12px;font-size:12px;color:var(--muted);display:flex;justify-content:space-between}
+  #ctrl{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+    display:flex;gap:12px;align-items:center;background:rgba(18,26,36,.82);
+    border:1px solid var(--line);border-radius:14px;padding:12px 16px;backdrop-filter:blur(6px);flex-wrap:wrap;justify-content:center;max-width:94vw}
+  #btnVR{background:var(--live);color:#04120f;border-color:var(--live);display:none}
+  @media (max-width:640px){#hud{min-width:0;left:12px;right:12px;top:12px}.cell .val{font-size:22px}}
+</style>
+</head>
+<body>
+
+<!-- ================= SELECTOR DE ROL ================= -->
+<div id="roleSelect">
+  <h1>Gemelo Digital · Transmisión en vivo</h1>
+  <p>El presentador mueve su celular; todos los espectadores ven el mismo gemelo moverse en tiempo real, cada uno desde su propio navegador.</p>
+  <div class="roleBtns">
+    <button class="primary" onclick="chooseRole('viewer')">🖥️ Ver el gemelo (espectador)</button>
+    <button onclick="chooseRole('sender')">📱 Soy el presentador (sensor)</button>
+  </div>
+  <p class="roomTag">Sala: <b id="roomLabel"></b> · el dato viaja por un broker MQTT público</p>
+</div>
+
+<!-- ================= VISTA: SENSOR ================= -->
+<div id="senderView">
+  <button class="back ghost" onclick="goHome()">← volver</button>
+  <div class="bigStatus"><span class="dot" id="sDot"></span><span id="sStatusTxt">Sensor inactivo</span></div>
+  <button class="primary" id="btnActivate" style="font-size:17px;padding:18px 28px">Activar giroscopio y transmitir</button>
+  <div class="senderReadouts">
+    <div class="cell"><div class="lbl">YAW</div><div class="val mono" id="sYawV">0</div></div>
+    <div class="cell"><div class="lbl">PITCH</div><div class="val mono" id="sPitchV">0</div></div>
+    <div class="cell"><div class="lbl">ROLL</div><div class="val mono" id="sRollV">0</div></div>
+  </div>
+  <p id="senderHint">Mantén la pantalla encendida mientras transmites. Todos los que tengan el link abierto verán el gemelo copiar tu movimiento.</p>
+</div>
+
+<!-- ================= VISTA: ESPECTADOR ================= -->
+<div id="viewerView">
+  <div id="scene"></div>
+  <button class="back ghost" onclick="goHome()">← volver</button>
+  <div id="hud">
+    <div class="eyebrow">Telemetría en vivo</div>
+    <div class="status"><span class="dot" id="rDot"></span><span id="rStatusTxt">Conectando al broker…</span></div>
+    <div class="readouts">
+      <div class="cell"><div class="lbl">YAW</div><div class="val mono" id="vYaw">0</div><div class="u">°</div></div>
+      <div class="cell"><div class="lbl">PITCH</div><div class="val mono" id="vPitch">0</div><div class="u">°</div></div>
+      <div class="cell"><div class="lbl">ROLL</div><div class="val mono" id="vRoll">0</div><div class="u">°</div></div>
+    </div>
+    <div class="rate"><span id="rSrcTxt">Fuente: —</span><span class="mono" id="hz">0 Hz</span></div>
+  </div>
+  <div id="ctrl">
+    <button id="btnVR">🥽 Entrar a VR</button>
+    <button id="btnFallback">▶ Simulación de respaldo</button>
+  </div>
+</div>
+
+<script>
+/* ============================================================
+   GEMELO DIGITAL — TRANSMISIÓN EN VIVO
+   Celular del presentador (giroscopio) ──publish──▶ broker MQTT (WSS)
+   Broker ──subscribe──▶ N espectadores (cada uno renderiza su gemelo)
+   Pipeline real: FÍSICO(IMU) → TRANSPORTE(MQTT/Internet) → RENDER(Three.js)
+   Requiere hosting HTTPS de nivel superior (p. ej. GitHub Pages).
+   ============================================================ */
+const params = new URLSearchParams(location.search);
+const ROOM  = (params.get('sala') || 'kusillo-demo-2026').replace(/[^\w-]/g,'').slice(0,40);
+const TOPIC = 'kusillo/gemelo/' + ROOM;
+document.getElementById('roomLabel').textContent = ROOM;
+
+const BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+  'wss://test.mosquitto.org:8081'
+];
+
+let client = null;
+
+function connectMqtt(onReady, onMessage, attempt = 0){
+  if(attempt >= BROKERS.length * 2){ onReady(null); return; }
+  const url = BROKERS[attempt % BROKERS.length];
+  let settled = false;
+  const c = mqtt.connect(url, {clean:true, connectTimeout:6000, reconnectPeriod:0,
+    clientId:'twin_' + Math.random().toString(16).slice(2,10)});
+  const fail = ()=>{ if(settled) return; settled = true;
+    try{ c.end(true); }catch(e){}
+    connectMqtt(onReady, onMessage, attempt+1); };
+  c.on('connect', ()=>{ if(settled) return; settled = true;
+    client = c;
+    if(onMessage){ c.subscribe(TOPIC); c.on('message', (t, payload)=>onMessage(payload)); }
+    onReady(url); });
+  c.on('error', fail);
+  setTimeout(fail, 7000);
+}
+
+/* ---------------- Navegación de roles ---------------- */
+const autoRole = params.get('rol');           // ?rol=ver | ?rol=sensor
+function chooseRole(role){
+  document.getElementById('roleSelect').style.display = 'none';
+  if(role==='sender'){ document.getElementById('senderView').style.display='flex'; initSender(); }
+  else{ document.getElementById('viewerView').style.display='block'; initViewer(); }
+}
+function goHome(){ location.href = location.pathname; }
+if(autoRole === 'ver') chooseRole('viewer');
+else if(autoRole === 'sensor') chooseRole('sender');
+
+/* ---------------- SENSOR (celular del presentador) ---------------- */
+function initSender(){
+  const dot = document.getElementById('sDot');
+  const statusTxt = document.getElementById('sStatusTxt');
+  const btn = document.getElementById('btnActivate');
+  let latest = {yaw:0, pitch:0, roll:0};
+  let firing = false, mqttOk = false;
+
+  connectMqtt(url=>{
+    mqttOk = !!url;
+    if(!mqttOk){ dot.className='dot bad'; statusTxt.textContent = 'Sin conexión al broker'; }
+    else if(!firing){ statusTxt.textContent = 'Broker listo — activa el giroscopio'; }
+  }, null);
+
+  function onOrient(e){
+    firing = true;
+    const yaw   = ((e.alpha||0) - 180);
+    const pitch = Math.max(-90, Math.min(90, e.beta||0));
+    const roll  = Math.max(-180, Math.min(180, e.gamma||0));
+    latest = {yaw, pitch, roll};
+    document.getElementById('sYawV').textContent   = Math.round(yaw);
+    document.getElementById('sPitchV').textContent = Math.round(pitch);
+    document.getElementById('sRollV').textContent  = Math.round(roll);
+    if(mqttOk){ dot.className='dot live'; statusTxt.textContent = 'Transmitiendo a la sala'; }
+  }
+
+  btn.addEventListener('click', async ()=>{
+    try{
+      if(typeof DeviceOrientationEvent !== 'undefined' &&
+         typeof DeviceOrientationEvent.requestPermission === 'function'){
+        const res = await DeviceOrientationEvent.requestPermission();   // iOS
+        if(res !== 'granted'){ statusTxt.textContent='Permiso denegado'; dot.className='dot bad'; return; }
+      }
+      window.addEventListener('deviceorientation', onOrient);
+      btn.style.display = 'none';
+      setTimeout(()=>{ if(!firing){ dot.className='dot bad';
+        statusTxt.textContent='El navegador no entrega datos del sensor'; } }, 2500);
+    }catch(err){
+      statusTxt.textContent = 'Este navegador no expone el giroscopio';
+      dot.className = 'dot bad';
+    }
+  });
+
+  // publica a ~10 Hz con retain: los que entren tarde reciben el último estado
+  setInterval(()=>{
+    if(!firing || !client) return;
+    try{
+      client.publish(TOPIC, JSON.stringify({...latest, ts: Date.now()}), {qos:0, retain:true});
+    }catch(e){}
+  }, 100);
+}
+
+/* ---------------- ESPECTADOR ---------------- */
+function initViewer(){
+  const target = {yaw:0, pitch:0, roll:0};
+  const view   = {yaw:0, pitch:0, roll:0};
+  let usingFallback = false;
+  let msgCount = 0, lastHzCheck = performance.now(), hzShown = 0, lastMsgAt = 0;
+
+  const rDot = document.getElementById('rDot');
+  const rStatusTxt = document.getElementById('rStatusTxt');
+  const rSrcTxt = document.getElementById('rSrcTxt');
+
+  connectMqtt(url=>{
+    if(!url){ rDot.className='dot bad'; rStatusTxt.textContent='Sin conexión al broker'; return; }
+    rStatusTxt.textContent = 'Esperando al presentador…';
+    rSrcTxt.textContent = 'Fuente: MQTT (' + new URL(url).host + ')';
+  }, payload=>{
+    try{
+      const d = JSON.parse(payload.toString());
+      if(usingFallback) return;
+      target.yaw = d.yaw||0; target.pitch = d.pitch||0; target.roll = d.roll||0;
+      msgCount++; lastMsgAt = performance.now();
+      rDot.className = 'dot live'; rStatusTxt.textContent = 'Presentador en vivo';
+    }catch(e){}
+  });
+
+  // ---------- Escena ----------
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0b0f14);
+  scene.fog = new THREE.Fog(0x0b0f14, 9, 26);
+  const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.05, 100);
+  camera.position.set(2.6, 2.2, 1.6);
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.xr.enabled = true;
+  document.getElementById('scene').appendChild(renderer.domElement);
+
+  scene.add(new THREE.HemisphereLight(0xbfe9ff, 0x0a0f15, 0.9));
+  const keyLight = new THREE.DirectionalLight(0xffffff, 1.1);
+  keyLight.position.set(5,8,4); scene.add(keyLight);
+  const grid = new THREE.GridHelper(20, 20, 0x21323f, 0x16222d); scene.add(grid);
+
+  const stage = new THREE.Group(); stage.position.set(0, 0, -1.8); scene.add(stage);
+  camera.lookAt(stage.position.x, 0.8, stage.position.z);
+
+  const robot = new THREE.Group();
+  const mat   = new THREE.MeshStandardMaterial({color:0x2a3a49, metalness:.5, roughness:.45});
+  const matHi = new THREE.MeshStandardMaterial({color:0x34e1c4, metalness:.3, roughness:.3,
+                                                emissive:0x0d3d35, emissiveIntensity:.6});
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.95,1.05,0.28,40), mat);
+  const body = new THREE.Mesh(new THREE.BoxGeometry(1.3,0.9,1.3), mat); body.position.y=0.75;
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.7,0.35,0.7), matHi); head.position.y=1.4;
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(0.22,0.6,24), matHi);
+  nose.rotation.x = Math.PI/2; nose.position.set(0,1.4,0.55);
+  robot.add(body, head, nose); robot.position.y = 0.14;
+  stage.add(base, robot);
+  const axesHelper = new THREE.AxesHelper(1.6); axesHelper.position.y = 0.14; stage.add(axesHelper);
+
+  // panel de telemetría visible dentro de VR
+  const panelCanvas = document.createElement('canvas');
+  panelCanvas.width = 512; panelCanvas.height = 192;
+  const pctx = panelCanvas.getContext('2d');
+  const panelTex = new THREE.CanvasTexture(panelCanvas);
+  const panel = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.15, 0.43),
+    new THREE.MeshBasicMaterial({map:panelTex, transparent:true}));
+  panel.position.set(0, 2.15, 0);
+  stage.add(panel);
+  function roundRect(c,x,y,w,h,r){
+    c.beginPath(); c.moveTo(x+r,y);
+    c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r);
+    c.arcTo(x,y+h,x,y,r); c.arcTo(x,y,x+w,y,r); c.closePath();
+  }
+  function drawPanel(){
+    pctx.clearRect(0,0,512,192);
+    pctx.fillStyle = 'rgba(18,26,36,0.88)'; pctx.strokeStyle = '#1f2c3a'; pctx.lineWidth = 3;
+    roundRect(pctx, 2, 2, 508, 188, 20); pctx.fill(); pctx.stroke();
+    pctx.fillStyle = '#7f93a6'; pctx.font = '600 20px sans-serif';
+    pctx.fillText('TELEMETRÍA EN VIVO', 28, 40);
+    pctx.font = '600 22px sans-serif';
+    pctx.fillStyle = usingFallback ? '#ffb454' : '#34e1c4';
+    pctx.fillText((usingFallback?'Simulación':'MQTT en vivo') + '  ·  ' + hzShown + ' Hz', 28, 74);
+    pctx.fillStyle = '#e8eef3'; pctx.font = '700 44px monospace';
+    pctx.fillText('Y ' + Math.round(view.yaw) + '°', 28, 140);
+    pctx.fillText('P ' + Math.round(view.pitch) + '°', 195, 140);
+    pctx.fillText('R ' + Math.round(view.roll) + '°', 360, 140);
+    panelTex.needsUpdate = true;
+  }
+
+  function applyOrientation(){
+    const k = 0.18;
+    view.yaw   += (target.yaw   - view.yaw)   * k;
+    view.pitch += (target.pitch - view.pitch) * k;
+    view.roll  += (target.roll  - view.roll)  * k;
+    const d2r = Math.PI/180;
+    const e = new THREE.Euler(view.pitch*d2r, view.yaw*d2r, view.roll*d2r, 'YXZ');
+    robot.setRotationFromEuler(e); axesHelper.setRotationFromEuler(e);
+  }
+
+  let panelTick = 0;
+  renderer.setAnimationLoop(()=>{
+    if(usingFallback){
+      const t = performance.now()/1000;
+      target.yaw = Math.sin(t*0.6)*120; target.pitch = Math.sin(t*0.9)*40; target.roll = Math.sin(t*1.3)*70;
+    } else if(lastMsgAt && performance.now()-lastMsgAt > 3000){
+      rDot.className = 'dot bad'; rStatusTxt.textContent = 'Señal del presentador perdida';
+    }
+    applyOrientation();
+    panel.lookAt(camera.getWorldPosition(new THREE.Vector3()));
+    if(++panelTick % 8 === 0) drawPanel();
+    document.getElementById('vYaw').textContent   = Math.round(view.yaw);
+    document.getElementById('vPitch').textContent = Math.round(view.pitch);
+    document.getElementById('vRoll').textContent  = Math.round(view.roll);
+    renderer.render(scene, camera);
+  });
+
+  addEventListener('resize', ()=>{
+    camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  setInterval(()=>{
+    const now = performance.now();
+    hzShown = usingFallback ? 0 : Math.round(msgCount/((now-lastHzCheck)/1000));
+    document.getElementById('hz').textContent = (usingFallback ? '—' : hzShown + ' Hz');
+    msgCount = 0; lastHzCheck = now;
+  }, 1000);
+
+  // VR para espectadores (Quest): mismo botón que la versión anterior
+  const btnVR = document.getElementById('btnVR');
+  if(navigator.xr && navigator.xr.isSessionSupported){
+    navigator.xr.isSessionSupported('immersive-vr').then(ok=>{
+      if(ok) btnVR.style.display = 'inline-block';
+    }).catch(()=>{});
+  }
+  btnVR.addEventListener('click', async ()=>{
+    try{
+      const session = await navigator.xr.requestSession('immersive-vr',
+        { optionalFeatures: ['local-floor'] });
+      await renderer.xr.setSession(session);
+    }catch(err){
+      rStatusTxt.textContent = 'No se pudo iniciar VR: ' + err.message;
+    }
+  });
+
+  document.getElementById('btnFallback').addEventListener('click', e=>{
+    usingFallback = !usingFallback;
+    e.target.textContent = usingFallback ? '📡 Volver a la señal en vivo' : '▶ Simulación de respaldo';
+    if(!usingFallback){ rStatusTxt.textContent = 'Esperando al presentador…'; rDot.className='dot'; }
+    else { rStatusTxt.textContent = 'Modo simulación'; rDot.className='dot sim'; }
+  });
+}
+</script>
+</body>
+</html>
