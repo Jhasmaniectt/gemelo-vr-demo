@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Projectile Motion AR</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #101418;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: #eef2f7; }
+  canvas { display: block; }
+  #overlay { position: fixed; inset: 0; pointer-events: none; }
+  #status { position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,.65); padding: 8px 14px; border-radius: 20px; font-size: 14px;
+    max-width: 90%; text-align: center; }
+  #panel { position: absolute; left: 12px; right: 12px; bottom: 12px; max-width: 460px; margin: 0 auto;
+    background: rgba(15,20,28,.85); border-radius: 14px; padding: 12px 14px; pointer-events: auto;
+    font-size: 14px; box-sizing: border-box; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+  .row label { width: 72px; }
+  .row input[type=range] { flex: 1; }
+  .row .val { width: 70px; text-align: right; font-variant-numeric: tabular-nums; }
+  select { flex: 1; padding: 6px; border-radius: 8px; background: #2b3a4f; color: #fff; border: 0; font-size: 14px; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  button { flex: 1; min-width: 80px; padding: 10px; border: 0; border-radius: 10px;
+    background: #2b3a4f; color: #fff; font-size: 14px; cursor: pointer; }
+  button.primary { background: #e4572e; }
+  button.ar { background: #2e86e4; }
+  .hidden { display: none !important; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 3px 4px; text-align: right; }
+  th:first-child, td:first-child { text-align: left; color: #9fb0c4; font-weight: normal; }
+  .hint { font-size: 12px; color: #9fb0c4; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <div id="status">Loading…</div>
+  <div id="panel">
+    <div class="row"><label for="angle">Angle</label>
+      <input id="angle" type="range" min="0" max="90" step="1" value="45"><span class="val" id="angleVal"></span></div>
+    <div class="row"><label for="speed">Speed</label>
+      <input id="speed" type="range" min="1" max="8" step="0.1" value="4"><span class="val" id="speedVal"></span></div>
+    <div class="row"><label for="gravity">Gravity</label>
+      <select id="gravity">
+        <option value="9.81">Earth (9.81 m/s²)</option>
+        <option value="1.62">Moon (1.62 m/s²)</option>
+        <option value="3.71">Mars (3.71 m/s²)</option>
+      </select></div>
+    <div class="row"><label for="slow">Slow motion</label>
+      <input id="slow" type="checkbox"><span class="hint">0.25× time</span></div>
+
+    <table>
+      <tr><th></th><th>Range</th><th>Max height</th><th>Time</th></tr>
+      <tr><td>Predicted</td><td id="pR">–</td><td id="pH">–</td><td id="pT">–</td></tr>
+      <tr><td>Last shot</td><td id="mR">–</td><td id="mH">–</td><td id="mT">–</td></tr>
+    </table>
+
+    <div class="btns">
+      <button id="launchBtn" class="primary">Launch</button>
+      <button id="clearBtn">Clear</button>
+      <button id="placeBtn" class="hidden">Reposition</button>
+      <button id="arBtn" class="ar hidden">Start AR</button>
+      <button id="exitBtn" class="hidden">Exit AR</button>
+    </div>
+    <div class="hint" id="hint">Desktop preview: drag to orbit. Grid cells are 0.5 m. No air resistance.</div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---------- State ----------
+const state = { angle: 45, speed: 4, g: 9.81, slow: false };
+const PIVOT_H = 0.08;      // pivot height above the surface (m)
+const BARREL = 0.18;       // barrel length (m)
+const BALL_R = 0.02;
+const MAX_SHOTS = 5;
+const MAX_PTS = 3000;
+const COLORS = [0xffd166, 0x06d6a0, 0xef476f, 0x118ab2, 0xc77dff];
+
+let arMode = false, placed = false, groundY = 0;
+let hitTestSource = null, hitTestRequested = false;
+let shotCount = 0;
+const shots = [];
+
+// ---------- DOM ----------
+const $ = id => document.getElementById(id);
+const overlay = $('overlay'), panel = $('panel'), statusEl = $('status');
+const setStatus = t => { statusEl.textContent = t; statusEl.classList.toggle('hidden', !t); };
+
+// ---------- Three.js setup ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const DESKTOP_BG = new THREE.Color(0x101418);
+scene.background = DESKTOP_BG;
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 100);
+camera.position.set(1.8, 1.1, 3.2);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(1.8, 0.3, 0);
+controls.update();
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(2, 4, 3);
+scene.add(sun);
+
+// Desktop ground grid (hidden in AR)
+const grid = new THREE.GridHelper(10, 20, 0x5a6b80, 0x2a3442);
+grid.position.x = 4;
+scene.add(grid);
+
+// ---------- Launcher ----------
+const launcher = new THREE.Group();
+const base = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.05, 0.06, PIVOT_H, 24),
+  new THREE.MeshStandardMaterial({ color: 0x3d4a5c, roughness: 0.6 }));
+base.position.y = PIVOT_H / 2;
+launcher.add(base);
+
+const pivot = new THREE.Group();
+pivot.position.y = PIVOT_H;
+launcher.add(pivot);
+
+const barrelGeo = new THREE.CylinderGeometry(0.018, 0.022, BARREL, 20);
+barrelGeo.rotateX(Math.PI / 2);          // align with +Z
+barrelGeo.translate(0, 0, BARREL / 2);   // extend from pivot forward
+const barrel = new THREE.Mesh(barrelGeo, new THREE.MeshStandardMaterial({ color: 0xe4572e, roughness: 0.4 }));
+pivot.add(barrel);
+const hub = new THREE.Mesh(new THREE.SphereGeometry(0.03, 20, 12),
+  new THREE.MeshStandardMaterial({ color: 0x222831 }));
+pivot.add(hub);
+
+// Desktop: launcher at origin facing +X
+launcher.rotation.y = Math.PI / 2;
+scene.add(launcher);
+
+// 3D label above the launcher (useful on headsets without DOM overlay)
+const labelCanvas = document.createElement('canvas');
+labelCanvas.width = 512; labelCanvas.height = 200;
+const labelCtx = labelCanvas.getContext('2d');
+const labelTex = new THREE.CanvasTexture(labelCanvas);
+const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: labelTex, depthTest: false, transparent: true }));
+label.scale.set(0.36, 0.14, 1);
+label.position.set(0, 0.42, 0);
+label.renderOrder = 10;
+launcher.add(label);
+
+// ---------- AR reticle ----------
+const reticle = new THREE.Mesh(
+  new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0xffffff }));
+reticle.matrixAutoUpdate = false;
+reticle.visible = false;
+scene.add(reticle);
+
+// ---------- Physics helpers ----------
+function predicted() {
+  const th = THREE.MathUtils.degToRad(state.angle);
+  const g = state.g, v = state.speed;
+  const h = PIVOT_H + BARREL * Math.sin(th);   // muzzle height above surface
+  const vx = v * Math.cos(th), vy = v * Math.sin(th);
+  const T = (vy + Math.sqrt(vy * vy + 2 * g * h)) / g;
+  return { R: vx * T, H: h + (vy * vy) / (2 * g), T };
+}
+
+const fmt = (x, u) => `${x.toFixed(2)} ${u}`;
+let lastShot = null;
+
+function refreshUI() {
+  $('angleVal').textContent = `${state.angle}°`;
+  $('speedVal').textContent = `${state.speed.toFixed(1)} m/s`;
+  pivot.rotation.x = -THREE.MathUtils.degToRad(state.angle);
+  const p = predicted();
+  $('pR').textContent = fmt(p.R, 'm'); $('pH').textContent = fmt(p.H, 'm'); $('pT').textContent = fmt(p.T, 's');
+  if (lastShot) {
+    $('mR').textContent = fmt(lastShot.R, 'm'); $('mH').textContent = fmt(lastShot.H, 'm'); $('mT').textContent = fmt(lastShot.T, 's');
+  }
+  drawLabel();
+}
+
+function drawLabel() {
+  const c = labelCtx;
+  c.clearRect(0, 0, 512, 200);
+  c.fillStyle = 'rgba(15,20,28,0.85)';
+  c.beginPath(); c.roundRect(4, 4, 504, 192, 24); c.fill();
+  c.fillStyle = '#ffffff';
+  c.font = 'bold 40px system-ui, sans-serif';
+  c.textAlign = 'center';
+  c.fillText(`θ ${state.angle}°   v ${state.speed.toFixed(1)} m/s`, 256, 70);
+  c.font = '32px system-ui, sans-serif';
+  c.fillStyle = '#9fd3ff';
+  c.fillText(`g = ${state.g} m/s²`, 256, 118);
+  c.fillStyle = '#ffd166';
+  c.fillText(lastShot ? `Last range: ${lastShot.R.toFixed(2)} m` : 'Ready to launch', 256, 165);
+  labelTex.needsUpdate = true;
+}
+
+// ---------- Shots ----------
+const ballGeo = new THREE.SphereGeometry(BALL_R, 20, 12);
+const markerGeo = new THREE.RingGeometry(0.02, 0.035, 24).rotateX(-Math.PI / 2);
+
+function launch() {
+  if (arMode && !placed) return;
+  launcher.updateMatrixWorld(true);
+  const p0 = pivot.localToWorld(new THREE.Vector3(0, 0, BARREL));
+  const q = new THREE.Quaternion();
+  pivot.getWorldQuaternion(q);
+  const v0 = new THREE.Vector3(0, 0, 1).applyQuaternion(q).multiplyScalar(state.speed);
+
+  const color = COLORS[shotCount++ % COLORS.length];
+  const ball = new THREE.Mesh(ballGeo, new THREE.MeshStandardMaterial({ color, roughness: 0.3 }));
+  ball.position.copy(p0);
+
+  const positions = new Float32Array(MAX_PTS * 3);
+  const lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  lineGeo.setDrawRange(0, 0);
+  const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color }));
+  line.frustumCulled = false;
+
+  scene.add(ball, line);
+  const shot = { ball, line, positions, count: 0, p0, v0, g: state.g, t: 0, maxY: p0.y, done: false, marker: null };
+  addPoint(shot, p0);
+  shots.push(shot);
+
+  while (shots.length > MAX_SHOTS) disposeShot(shots.shift());
+}
+
+function addPoint(s, p) {
+  if (s.count >= MAX_PTS) return;
+  if (s.count > 0) {
+    const i = (s.count - 1) * 3;
+    const dx = p.x - s.positions[i], dy = p.y - s.positions[i + 1], dz = p.z - s.positions[i + 2];
+    if (dx * dx + dy * dy + dz * dz < 1e-4) return;   // 1 cm spacing
+  }
+  s.positions.set([p.x, p.y, p.z], s.count * 3);
+  s.count++;
+  s.line.geometry.setDrawRange(0, s.count);
+  s.line.geometry.attributes.position.needsUpdate = true;
+}
+
+function disposeShot(s) {
+  scene.remove(s.ball, s.line);
+  s.line.geometry.dispose();
+  s.ball.material.dispose(); s.line.material.dispose();
+  if (s.marker) { scene.remove(s.marker); s.marker.material.dispose(); }
+}
+
+function clearShots() {
+  while (shots.length) disposeShot(shots.pop());
+  lastShot = null;
+  ['mR', 'mH', 'mT'].forEach(id => $(id).textContent = '–');
+  drawLabel();
+}
+
+const tmp = new THREE.Vector3();
+function updateShots(dt) {
+  for (const s of shots) {
+    if (s.done) continue;
+    s.t += dt;
+    let y = s.p0.y + s.v0.y * s.t - 0.5 * s.g * s.t * s.t;
+    if (y <= groundY) {
+      // Exact landing time: -g/2 t² + vy t + (y0 - ground) = 0
+      const a = -0.5 * s.g, b = s.v0.y, c = s.p0.y - groundY;
+      s.t = (-b - Math.sqrt(b * b - 4 * a * c)) / (2 * a);
+      s.done = true;
+    }
+    tmp.set(s.p0.x + s.v0.x * s.t, s.p0.y + s.v0.y * s.t - 0.5 * s.g * s.t * s.t, s.p0.z + s.v0.z * s.t);
+    s.ball.position.copy(tmp);
+    s.maxY = Math.max(s.maxY, tmp.y);
+    addPoint(s, tmp);
+
+    if (s.done) {
+      const R = Math.hypot(tmp.x - s.p0.x, tmp.z - s.p0.z);
+      lastShot = { R, H: s.maxY - groundY, T: s.t };
+      s.marker = new THREE.Mesh(markerGeo, new THREE.MeshBasicMaterial({ color: s.ball.material.color }));
+      s.marker.position.set(tmp.x, groundY + 0.002, tmp.z);
+      scene.add(s.marker);
+      refreshUI();
+    }
+  }
+}
+
+// ---------- AR session ----------
+async function initAR() {
+  if (!('xr' in navigator) || !window.isSecureContext) {
+    setStatus(window.isSecureContext ? 'WebXR not available — desktop preview' : 'Needs HTTPS for AR — desktop preview');
+    return;
+  }
+  const ok = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+  if (ok) { $('arBtn').classList.remove('hidden'); setStatus('AR available — press Start AR'); }
+  else setStatus('AR not supported on this device — desktop preview');
+}
+
+async function startAR() {
+  try {
+    const session = await navigator.xr.requestSession('immersive-ar', {
+      optionalFeatures: ['hit-test', 'dom-overlay'],
+      domOverlay: { root: overlay }
+    });
+    renderer.xr.setReferenceSpaceType('local');
+    await renderer.xr.setSession(session);
+    session.addEventListener('end', onSessionEnd);
+
+    arMode = true; placed = false;
+    scene.background = null;
+    grid.visible = false; launcher.visible = false;
+    controls.enabled = false;
+    clearShots();
+    $('arBtn').classList.add('hidden');
+    $('exitBtn').classList.remove('hidden');
+    $('placeBtn').classList.remove('hidden');
+    $('hint').textContent = 'Tap the scene (or pull the trigger) to place, then again to launch.';
+    setStatus('Move your device to find a surface, then tap to place the launcher');
+  } catch (e) {
+    setStatus('Could not start AR: ' + e.message);
+  }
+}
+
+function onSessionEnd() {
+  arMode = false; placed = false;
+  hitTestSource = null; hitTestRequested = false;
+  reticle.visible = false;
+  scene.background = DESKTOP_BG;
+  grid.visible = true; launcher.visible = true;
+  launcher.position.set(0, 0, 0); launcher.rotation.set(0, Math.PI / 2, 0);
+  groundY = 0;
+  controls.enabled = true;
+  clearShots();
+  $('arBtn').classList.remove('hidden');
+  $('exitBtn').classList.add('hidden');
+  $('placeBtn').classList.add('hidden');
+  $('hint').textContent = 'Desktop preview: drag to orbit. Grid cells are 0.5 m. No air resistance.';
+  setStatus('AR session ended — desktop preview');
+}
+
+function placeLauncher() {
+  const xrCam = renderer.xr.getCamera();
+  const camPos = new THREE.Vector3(), fwd = new THREE.Vector3();
+  xrCam.getWorldPosition(camPos);
+  xrCam.getWorldDirection(fwd);
+
+  if (reticle.visible) {
+    launcher.position.setFromMatrixPosition(reticle.matrix);
+  } else {
+    // Fallback without hit-test: 1 m ahead, 1 m below the viewer
+    const flat = new THREE.Vector3(fwd.x, 0, fwd.z).normalize();
+    launcher.position.copy(camPos).addScaledVector(flat, 1.0);
+    launcher.position.y = camPos.y - 1.0;
+  }
+  launcher.rotation.set(0, Math.atan2(fwd.x, fwd.z), 0);   // aim away from the viewer
+  launcher.visible = true;
+  groundY = launcher.position.y;
+  placed = true;
+  reticle.visible = false;
+  clearShots();
+  setStatus('Tap the scene or press Launch');
+}
+
+function onSelect() {
+  if (!arMode) return;
+  if (!placed) placeLauncher(); else launch();
+}
+
+for (let i = 0; i < 2; i++) {
+  const ctrl = renderer.xr.getController(i);
+  ctrl.addEventListener('select', onSelect);
+  scene.add(ctrl);
+}
+// Taps on the panel should not also fire a scene "select"
+panel.addEventListener('beforexrselect', e => e.preventDefault());
+
+// ---------- UI wiring ----------
+$('angle').addEventListener('input', e => { state.angle = +e.target.value; refreshUI(); });
+$('speed').addEventListener('input', e => { state.speed = +e.target.value; refreshUI(); });
+$('gravity').addEventListener('change', e => { state.g = +e.target.value; refreshUI(); });
+$('slow').addEventListener('change', e => { state.slow = e.target.checked; });
+$('launchBtn').addEventListener('click', launch);
+$('clearBtn').addEventListener('click', clearShots);
+$('placeBtn').addEventListener('click', () => {
+  placed = false; launcher.visible = false; clearShots();
+  setStatus('Find a surface, then tap to place the launcher');
+});
+$('arBtn').addEventListener('click', startAR);
+$('exitBtn').addEventListener('click', () => renderer.xr.getSession()?.end());
+
+window.addEventListener('resize', () => {
+  if (renderer.xr.isPresenting) return;
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---------- Loop ----------
+const clock = new THREE.Clock();
+renderer.setAnimationLoop((time, frame) => {
+  const dt = Math.min(clock.getDelta(), 0.05) * (state.slow ? 0.25 : 1);
+
+  if (frame && arMode) {
+    const session = renderer.xr.getSession();
+    if (!hitTestRequested) {
+      hitTestRequested = true;
+      session.requestReferenceSpace('viewer')
+        .then(vs => session.requestHitTestSource ? session.requestHitTestSource({ space: vs }) : null)
+        .then(src => { hitTestSource = src; })
+        .catch(() => { hitTestSource = null; });
+    }
+    if (hitTestSource && !placed) {
+      const results = frame.getHitTestResults(hitTestSource);
+      if (results.length) {
+        const pose = results[0].getPose(renderer.xr.getReferenceSpace());
+        reticle.visible = true;
+        reticle.matrix.fromArray(pose.transform.matrix);
+      } else reticle.visible = false;
+    }
+  }
+
+  updateShots(dt);
+  if (!renderer.xr.isPresenting) controls.update();
+  renderer.render(scene, camera);
+});
+
+refreshUI();
+initAR();
+</script>
+</body>
+</html>
